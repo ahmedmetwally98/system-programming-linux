@@ -1,10 +1,3 @@
-# compile each .c file to .o file and put them in the obj folder
-# then from each object file, create the executable file
-# add rule to run the executable file with the input file name
-# add rule to remove the object files 
-# add rule to remove the executable files
-# add rule to remove the output files
-
 # define the compiler
 CC = gcc
 
@@ -36,16 +29,16 @@ all: $(EXE)
 $(EXE_DIR)/$(catEXE): $(OBJ_DIR)/mycat.o 	| $(EXE_DIR)
 	$(LD) -o $@ $(OBJ_DIR)/mycat.o $(LDFLAGS)
 
-$(EXE_DIR)/$(cpEXE): $(OBJ_DIR)/mycp.o 	| $(EXE_DIR)
+$(EXE_DIR)/$(cpEXE): $(OBJ_DIR)/mycp.o 		| $(EXE_DIR)
 	$(LD) -o $@ $(OBJ_DIR)/mycp.o $(LDFLAGS)
 
-$(EXE_DIR)/$(mvEXE): $(OBJ_DIR)/mymv.o 	| $(EXE_DIR)
+$(EXE_DIR)/$(mvEXE): $(OBJ_DIR)/mymv.o 		| $(EXE_DIR)
 	$(LD) -o $@ $(OBJ_DIR)/mymv.o $(LDFLAGS)
 
 $(EXE_DIR)/$(pwdEXE): $(OBJ_DIR)/mypwd.o 	| $(EXE_DIR)
 	$(LD) -o $@ $(OBJ_DIR)/mypwd.o $(LDFLAGS)
 
-$(EXE_DIR)/$(echoEXE): $(OBJ_DIR)/myecho.o | $(EXE_DIR)
+$(EXE_DIR)/$(echoEXE): $(OBJ_DIR)/myecho.o 	| $(EXE_DIR)
 	$(LD) -o $@ $(OBJ_DIR)/myecho.o $(LDFLAGS)
 
 
