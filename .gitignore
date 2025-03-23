@@ -1,0 +1,6 @@
+linux_utilities/bin/
+linux_utilities/obj
+linux_utilities/.vscode
+
+linux_utilities/obj/*
+linux_utilities/bin/*
