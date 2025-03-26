@@ -1,0 +1,7 @@
+obj/
+bin/
+bin/*
+obj/*
+
+# ignore editor config files
+.vscode/
