@@ -1,6 +1,13 @@
 linux_utilities/bin/
 linux_utilities/obj
 linux_utilities/.vscode
-
+# ignore editor config files
 linux_utilities/obj/*
 linux_utilities/bin/*
+############################
+shells/obj/
+shells/bin/
+shells/bin/*
+shells/obj/*
+# ignore editor config files
+shells/.vscode/
