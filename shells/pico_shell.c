@@ -1,435 +1,312 @@
 #define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-/****** Declarations/Macros ******/
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
-#define PROMPT_MAX_SZ    (HOST_NAME_MAX + 9)
-/* define the shell built-in command */
-#define CMD_IDX_00       0
-#define CMD_IDX_01       1
-/* define command to be executed in child proc */
-#define CMD_IDX_10       2
-#define CMD_IDX_11       3
-#define CMD_UNDEFINED    (-1)
-#define MAX_TOKENS_COUNT 1024
-#define TOTAL_SUP_CMD    4
-#define ERR_INVL_CMD     "ERROR: Invalid command\n"
-#define END_MSG          "Good Bye!\n"
-#define ERR_MEM_ALLOC    "ERROR: Memory allocation failed\n"
 
-typedef struct
-{
-    char  *sup_cmds;
-    size_t cmd_id;
-} cmdConfig_t;
+#define PROMPT "PS> "
+#define INITIAL_TOK_CAP 8
+#define END_MSG "Good Bye!\n"
 
-/****** global varialbes ******/
-const char *sup_commands[] = {"exit", "cd", "echo", "pwd"};
-static int  exit_code      = 0;
-static int  exit_flag      = 0;
+static void setup_signals(void);
+static char** tokenize_input(char* input, size_t* argc_out);
+static void free_tokens(char** tokens);
 
-/****** function prototypes ******/
-// command functions
-int  PS_get_cmd_idx(char *cmdName);
-void PS_cmd_echo(char *argv[]);
-void PS_cmd_pwd(char *argv[]);
-int  PS_cmd_exit(char *argv[]);
-int  PS_cmd_cd(char *path);
+static bool run_builtin(char** argv, size_t argc, int* should_exit, int* exit_code);
+static int builtin_echo(char** argv);
+static int builtin_pwd(void);
+static int builtin_cd(char** argv, size_t argc);
+static int builtin_exit(char** argv, size_t argc, int last_status);
 
-// utility functions
-void   setup_signals(void);
-char **tokenize_input(char *input, size_t *token_count);
-void   PS_init_cmdDB(cmdConfig_t *totalcmds, int cmdIdx);
-char  *create_prompt(void);
-void   free_tokens(char **tokens);
-bool   isBuiltin(int cmdIdx);
-
-/****** main function ******/
 int main(void)
 {
-    // Setup signal handlers
+    char* line = NULL;
+    size_t line_cap = 0;
+    int shell_exit_code = EXIT_SUCCESS;
+    int should_exit = 0;
+
     setup_signals();
 
-    /** define local variables */
-    cmdConfig_t sup_cmds[TOTAL_SUP_CMD];
-    char       *buf       = NULL;
-    char      **tokensArr = NULL;
-    char       *prompt    = NULL;
-    size_t      bufcount  = 0;
-    size_t      tokcount  = 0;
-    ssize_t     nread     = 0;
+    while (!should_exit)
+    {
+        ssize_t nread;
+        char** argv = NULL;
+        size_t argc = 0;
 
-    // Create shell prompt
-    prompt = create_prompt();
-    if (!prompt)
-    {
-        return EXIT_FAILURE;
-    }
-    // fill the command database
-    for (int i = TOTAL_SUP_CMD - 1; i >= 0; --i)
-    {
-        PS_init_cmdDB(&(sup_cmds[i]), i);
-    }
-
-    while (1)
-    {
-        if (write(STDOUT_FILENO, prompt, PROMPT_MAX_SZ) < 0)
+        if (write(STDOUT_FILENO, PROMPT, strlen(PROMPT)) < 0)
         {
             perror("write");
-            exit(1);
+            shell_exit_code = errno;
+            break;
         }
-        fflush(stdout);
 
-        // Read input from stdin
-        nread = getline(&buf, &bufcount, stdin);
-
+        nread = getline(&line, &line_cap, stdin);
         if (nread == -1)
         {
             if (feof(stdin))
             {
-                // End of file reached only when ctrl+D is pressed. exit the
-                // program.
                 break;
             }
-            else
-            {
-                perror("getline");
-                continue;
-            }
-            // "EINVAL" error number shouldn't happen as there is no valid
-            // reason to occur.
-        }
-
-        // skip empty lines
-        if (nread <= 1)
-        {
+            perror("getline");
+            shell_exit_code = errno;
             continue;
         }
 
-        tokensArr = tokenize_input(buf, &tokcount);
-
-        /* if the command is not cd nor exit, we can execute it in the
-         * child process, otherwise execute it in the parent process.*/
-        // check if the command is a built-in command
-        int cmdIdx = PS_get_cmd_idx(tokensArr[0]);
-        if (cmdIdx == CMD_UNDEFINED)
+        argv = tokenize_input(line, &argc);
+        if (argv == NULL)
         {
-            write(STDERR_FILENO, ERR_INVL_CMD, strlen(ERR_INVL_CMD));
-            free_tokens(tokensArr);
-            tokensArr = NULL;
+            shell_exit_code = ENOMEM;
+            break;
+        }
+
+        if (argc == 0)
+        {
+            free_tokens(argv);
             continue;
         }
-        // check if the command is a built-in command
-        if (isBuiltin(cmdIdx))
-        {
-            // Built-in command, execute in the parent process
-            switch (cmdIdx)
-            {
-            case CMD_IDX_00:
-                exit_code = PS_cmd_exit(&tokensArr[1]);
-                exit_flag = 1;
-                break;
-            case CMD_IDX_01:
-                PS_cmd_cd(tokensArr[1]);
-                break;
-            default:
-                break;
-            }
-            // Free tokens array and continue to the next iteration
-            free_tokens(tokensArr);
-            tokensArr = NULL;
 
-            if (exit_flag)
+        if (run_builtin(argv, argc, &should_exit, &shell_exit_code))
+        {
+            free_tokens(argv);
+            continue;
+        }
+
+        pid_t pid = fork();
+        if (pid == -1)
+        {
+            perror("fork");
+            shell_exit_code = errno;
+            free_tokens(argv);
+            continue;
+        }
+
+        if (pid == 0)
+        {
+            execvp(argv[0], argv);
+            if (errno == ENOENT)
             {
-                break;
+                dprintf(STDERR_FILENO, "%s: command not found\n", argv[0]);
             }
             else
             {
-                continue;
+                perror(argv[0]);
             }
+            _exit(127);
         }
-        else
+
+        int status = 0;
+        if (waitpid(pid, &status, 0) == -1)
         {
-            // External command, execute in the child process
-            pid_t PID = fork();
-
-            if (PID == -1) // failed to create child proc
-            {
-                perror("fork");
-                free_tokens(tokensArr);
-                tokensArr = NULL;
-                exit_code = errno;
-                break;
-            }
-            else if (PID == 0) // child process
-            {
-                switch (PS_get_cmd_idx(tokensArr[0]))
-                {
-                case CMD_IDX_10:
-                    PS_cmd_echo(&tokensArr[0]);
-                    break;
-                case CMD_IDX_11:
-                    PS_cmd_pwd(&tokensArr[0]);
-                    break;
-                default:
-                    write(STDERR_FILENO, ERR_INVL_CMD, strlen(ERR_INVL_CMD));
-                    break;
-                }
-                // terminate the child proc
-                free_tokens(tokensArr);
-                tokensArr = NULL;
-                break;
-            }
-            else // parent proc
-            {
-                int status;
-                if (waitpid(PID, &status, 0) == -1) // failure indication
-                {
-                    perror("Child process failed");
-                    exit(errno);
-                }
-
-                // Free tokens array regardless of exit condition
-                free_tokens(tokensArr);
-                tokensArr = NULL;
-            }
+            perror("waitpid");
+            shell_exit_code = errno;
         }
-    }
-
-    if (buf)
-    {
-        free(buf);
-        buf = NULL;
-    }
-    if (prompt)
-    {
-        free(prompt);
-        prompt = NULL;
-    }
-
-    return exit_code;
-}
-// function prototypes
-inline int PS_get_cmd_idx(char *cmdName)
-{
-    for (int i = 0; i < TOTAL_SUP_CMD; ++i)
-    {
-        if (strcmp(cmdName, sup_commands[i]) == 0)
+        else if (WIFEXITED(status))
         {
-            return i;
+            shell_exit_code = WEXITSTATUS(status);
         }
-    }
-
-    // command not found
-    return CMD_UNDEFINED;
-}
-
-void PS_cmd_echo(char *argv[])
-{
-    if (execve("/usr/bin/echo", argv, NULL) == -1)
-    {
-        perror("failed with execve");
-        exit(errno);
-    }
-}
-
-int PS_cmd_exit(char *argv[])
-{
-    // exit with 0 if no arguments or error code if any
-    write(STDOUT_FILENO, END_MSG, strlen(END_MSG));
-
-    if (argv[0] != NULL)
-    {
-        return atoi(argv[0]);
-    }
-
-    return EXIT_SUCCESS;
-}
-
-void PS_cmd_pwd(char *argv[])
-{
-    if (execve("/usr/bin/pwd", argv, NULL) == -1)
-    {
-        perror("failed with execve");
-        exit(errno);
-    }
-}
-
-int PS_cmd_cd(char *path)
-{
-    char  cwd[PATH_MAX];
-    char *oldpwd = getenv("OLDPWD");
-
-    // Handle '~' (home directory)
-    if (path == NULL || strcmp(path, "~") == 0)
-    {
-        path = getenv("HOME");
-    }
-    // Handle '-' (previous directory)
-    else if (strcmp(path, "-") == 0)
-    {
-        if (oldpwd == NULL)
+        else if (WIFSIGNALED(status))
         {
-            fprintf(stderr, "cd: OLDPWD not set\n");
-            return -1;
+            shell_exit_code = 128 + WTERMSIG(status);
         }
-        path = oldpwd;
+
+        free_tokens(argv);
     }
 
-    // Save current directory before changing
-    if (getcwd(cwd, sizeof(cwd)) == NULL)
+    free(line);
+    return shell_exit_code;
+}
+
+static bool run_builtin(char** argv, size_t argc, int* should_exit, int* exit_code)
+{
+    if (strcmp(argv[0], "echo") == 0)
     {
-        perror("getcwd");
-        return -1;
+        *exit_code = builtin_echo(argv);
+        return true;
     }
 
-    // Attempt to change directory
-    if (chdir(path) != 0)
+    if (strcmp(argv[0], "pwd") == 0)
     {
-        perror("cd");
-        return -1;
+        *exit_code = builtin_pwd();
+        return true;
     }
 
-    // Update OLDPWD and PWD environment variables
-    setenv("OLDPWD", cwd, 1);
-    // Get the new current directory
-    if (getcwd(cwd, sizeof(cwd)) == NULL)
+    if (strcmp(argv[0], "cd") == 0)
     {
-        perror("getcwd");
-        return -1;
+        *exit_code = builtin_cd(argv, argc);
+        return true;
     }
 
-    setenv("PWD", cwd, 1);
-
-    // Print the new current directory
-    if (write(STDOUT_FILENO, cwd, strlen(cwd)) < 0)
+    if (strcmp(argv[0], "exit") == 0)
     {
-        perror("write");
-        return -1;
+        *exit_code = builtin_exit(argv, argc, *exit_code);
+        *should_exit = 1;
+        return true;
     }
+
+    return false;
+}
+
+static int builtin_echo(char** argv)
+{
+    for (size_t i = 1; argv[i] != NULL; ++i)
+    {
+        if (i > 1)
+        {
+            if (write(STDOUT_FILENO, " ", 1) < 0)
+            {
+                perror("write");
+                return 1;
+            }
+        }
+        if (write(STDOUT_FILENO, argv[i], strlen(argv[i])) < 0)
+        {
+            perror("write");
+            return 1;
+        }
+    }
+
     if (write(STDOUT_FILENO, "\n", 1) < 0)
     {
         perror("write");
-        return -1;
+        return 1;
     }
 
     return 0;
 }
 
-void PS_init_cmdDB(cmdConfig_t *totalcmds, int cmdIdx)
+static int builtin_pwd(void)
 {
-    if (totalcmds != NULL)
+    char cwd[PATH_MAX];
+
+    if (getcwd(cwd, sizeof(cwd)) == NULL)
     {
-        totalcmds->sup_cmds = (char *)sup_commands[cmdIdx];
-        totalcmds->cmd_id   = cmdIdx;
+        perror("getcwd");
+        return 1;
+    }
+
+    if (write(STDOUT_FILENO, cwd, strlen(cwd)) < 0)
+    {
+        perror("write");
+        return 1;
+    }
+    if (write(STDOUT_FILENO, "\n", 1) < 0)
+    {
+        perror("write");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int builtin_cd(char** argv, size_t argc)
+{
+    const char* target = NULL;
+    if (argc < 2)
+    {
+        target = getenv("HOME");
+        if (target == NULL)
+        {
+            fprintf(stderr, "cd: HOME not set\n");
+            return 1;
+        }
     }
     else
     {
-        if (write(STDERR_FILENO, "Invlaid pointer\n",
-                  strlen("Invlaid pointer\n")) < 0)
+        target = argv[1];
+    }
+
+    if (chdir(target) != 0)
+    {
+        fprintf(stderr, "cd: %s: %s\n", target, strerror(errno));
+        return 1;
+    }
+
+    return 0;
+}
+
+static int builtin_exit(char** argv, size_t argc, int last_status)
+{
+    if (write(STDOUT_FILENO, END_MSG, strlen(END_MSG)) < 0)
+    {
+        perror("write");
+    }
+
+    if (argc < 2)
+    {
+        return last_status;
+    }
+
+    char* endptr = NULL;
+    long code = strtol(argv[1], &endptr, 10);
+    if (endptr == argv[1] || *endptr != '\0')
+    {
+        return EXIT_FAILURE;
+    }
+
+    return (int)(code & 0xFF);
+}
+
+static char** tokenize_input(char* input, size_t* argc_out)
+{
+    size_t cap = INITIAL_TOK_CAP;
+    size_t argc = 0;
+    char** tokens = malloc(cap * sizeof(*tokens));
+    if (tokens == NULL)
+    {
+        perror("malloc");
+        return NULL;
+    }
+
+    char* token = strtok(input, " \n");
+    while (token != NULL)
+    {
+        if (argc + 1 >= cap)
         {
-            exit(-1);
+            cap *= 2;
+            char** tmp = realloc(tokens, cap * sizeof(*tokens));
+            if (tmp == NULL)
+            {
+                free(tokens);
+                perror("realloc");
+                return NULL;
+            }
+            tokens = tmp;
         }
-    }
-}
 
-char *create_prompt(void)
-{
-    char hostname[HOST_NAME_MAX + 1];
-
-    if (gethostname(hostname, sizeof(hostname)) == -1)
-    {
-        perror("gethostname");
-        return NULL;
+        tokens[argc++] = token;
+        token = strtok(NULL, " \n");
     }
 
-    char *prompt = malloc(PROMPT_MAX_SZ);
-    if (!prompt)
-    {
-        perror(ERR_MEM_ALLOC);
-        return NULL;
-    }
-
-    snprintf(prompt, PROMPT_MAX_SZ, "[%s@spl]$ ", hostname);
-
-    return prompt;
-}
-
-char **tokenize_input(char *input, size_t *token_count)
-{
-    char **tokens = malloc(sizeof(char *) * MAX_TOKENS_COUNT);
-    if (!tokens)
-    {
-        perror(ERR_MEM_ALLOC);
-        return NULL;
-    }
-
-    char  *token = strtok(input, " \n");
-    size_t i     = 0;
-
-    while (token && i < MAX_TOKENS_COUNT - 1)
-    {
-        tokens[i++] = token;
-        token       = strtok(NULL, " \n");
-    }
-
-    tokens[i]    = NULL;
-    *token_count = i;
-
+    tokens[argc] = NULL;
+    *argc_out = argc;
     return tokens;
 }
 
-void free_tokens(char **tokens)
+static void free_tokens(char** tokens)
 {
-    if (tokens)
-    {
-        free(tokens);
-    }
+    free(tokens);
 }
 
-bool isBuiltin(int cmdIdx)
+static void setup_signals(void)
 {
-    if (cmdIdx == CMD_IDX_00 || cmdIdx == CMD_IDX_01)
-    {
-        return true;
-    }
-    return false;
-}
-
-void setup_signals(void)
-{
-    /*! add signal handling to our shell so that it can be responsive to
-         1. ctrl+C
-         2. ctrl+\
-         3. ctrl+z
-    */
     struct sigaction sa;
-
-    // Set up common signal attributes
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
 
-    // Ignore SIGINT (Ctrl+C)
     sa.sa_handler = SIG_IGN;
     sigaction(SIGINT, &sa, NULL);
 
-    // Default action for SIGQUIT (Ctrl+\)
     sa.sa_handler = SIG_DFL;
     sigaction(SIGQUIT, &sa, NULL);
-
-    // Default action for SIGTSTP (Ctrl+Z)
-    sa.sa_handler = SIG_DFL;
     sigaction(SIGTSTP, &sa, NULL);
 }
